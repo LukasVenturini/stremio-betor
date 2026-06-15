@@ -21,7 +21,7 @@ carregarDadosBeTor();
 
 const manifest = {
     id: "community.betorbr.online",
-    version: "1.0.6",
+    version: "1.0.7",
     name: "BeTor v3 Oficial",
     description: "Busca torrents brasileiros direto do catálogo atualizado do BeTor",
     resources: ["stream"],
@@ -31,15 +31,6 @@ const manifest = {
 };
 
 const builder = new addonBuilder(manifest);
-
-// Função para tentar limpar o título e pegar palavras-chave da obra
-function obterPalavrasChave(texto) {
-    if (!texto) return [];
-    let limpo = texto.toLowerCase()
-        .split(/(?:\d{4}|1080p|720p|4k|bluray|web\-dl|h264|x264|x265|dual|dublado|temporada|season|s\d+e\d+)/i)[0];
-    limpo = limpo.replace(/[\.\-_,:\(\)]/g, " ");
-    return limpo.split(/\s+/).filter(p => p.length > 2 && p !== "the" && p !== "dos" && p !== "com");
-}
 
 builder.defineStreamHandler(async ({ type, id }) => {
     const partesId = id.split(":");
@@ -52,21 +43,40 @@ builder.defineStreamHandler(async ({ type, id }) => {
 
     if (resultados.length === 0) return { streams: [] };
 
-    // Tenta descobrir o nome real da série baseado nos títulos mais frequentes para esse ID
-    let palavrasChaveObra = [];
-    if (resultados.length > 0) {
-        // Pega os 3 primeiros títulos para analisar
-        const amostras = resultados.slice(0, 3).map(r => r.torrent_name || "");
-        for (const amostra of amostras) {
-            const palavras = obterPalavrasChave(amostra);
-            if (palavras.length > 0) {
-                palavrasChaveObra = palavras;
-                break;
+    // --- ALGORITMO DE VOTAÇÃO POR MAIORIA (ANTI-INTRUSO) ---
+    const contagemPalavras = {};
+    const termosIgnorados = new Set(["the", "dos", "com", "para", "dual", "dublado", "web", "dl", "bluray", "h264", "x264", "x265", "1080p", "720p", "4k", "temporada", "season", "completa", "pack", "complete"]);
+
+    // Conta a frequência de cada palavra em TODOS os resultados do mesmo ID
+    resultados.forEach(item => {
+        const nome = (item.torrent_name || "").toLowerCase();
+        const tituloBase = nome.split(/(?:\d{4}|1080p|720p|4k|bluray|web\-dl|h264|x264|x265|dual|dublado)/i)[0];
+        const palavras = tituloBase.replace(/[\.\-_,:\(\)\[\]]/g, " ").split(/\s+/);
+        
+        palavras.forEach(p => {
+            if (p.length > 2 && !termosIgnorados.has(p)) {
+                contagemPalavras[p] = (contagemPalavras[p] || 0) + 1;
             }
+        });
+    });
+
+    // Descobre qual é a palavra campeã de acessos (o nome real da série)
+    let palavraChaveReal = "";
+    let maiorFrequencia = 0;
+    for (const [palavra, freq] of Object.entries(contagemPalavras)) {
+        if (freq > maiorFrequencia) {
+            maiorFrequencia = freq;
+            palavraChaveReal = palavra;
         }
     }
 
-    // 2. Se for SÉRIE, aplicamos a filtragem inteligente matemática + validação de palavras-chave
+    // Só ativa a trava de nome se houver um padrão claro de repetição (catálogo limpo)
+    const usarFiltroNome = maiorFrequencia >= Math.max(2, Math.floor(resultados.length * 0.20)) && palavraChaveReal;
+    if (usarFiltroNome) {
+        console.log(`[Filtro] Palavra-chave soberana identificada para este ID: "${palavraChaveReal}"`);
+    }
+
+    // 2. Se for SÉRIE, aplica os filtros matemáticos cruzados com a palavra soberana
     if (type === "series" && partesId[1] && partesId[2]) {
         const sAlvo = parseInt(partesId[1], 10); 
         const eAlvo = parseInt(partesId[2], 10); 
@@ -76,56 +86,46 @@ builder.defineStreamHandler(async ({ type, id }) => {
 
         resultados = resultados.filter(item => {
             const nomeTorrent = (item.torrent_name || "").toLowerCase();
-            const nomeTorrentLimpo = nomeTorrent.replace(/[\.\-_]/g, " ");
 
-            // Validação de segurança anti-intruso:
-            // Se descobrimos palavras-chave da série (ex: ["boys"]), o torrent obrigatoriamente precisa ter essa palavra.
-            // Isso elimina séries aleatórias (como "Off Campus") cadastradas com o ID errado.
-            if (palavrasChaveObra.length > 0) {
-                const temPalavraChave = palavrasChaveObra.some(p => nomeTorrentLimpo.includes(p));
-                if (!temPalavraChave) return false; 
+            // Regra de Ouro: Se o torrent não tiver a palavra mais votada do ID (Ex: "boys"), ele é descartado na hora
+            if (usarFiltroNome && !nomeTorrent.replace(/[\.\-_]/g, " ").includes(palavraChaveReal)) {
+                return false; 
             }
 
-            const textosParaVerificar = [nomeTorrent];
+            // Checa primeiro os arquivos internos (se for um Pack com lista detalhada)
             if (item.torrent_files && Array.isArray(item.torrent_files)) {
-                item.torrent_files.forEach(f => textosParaVerificar.push(f.toLowerCase()));
+                const temEpNosArquivos = item.torrent_files.some(f => {
+                    const match = f.toLowerCase().match(regexEpisodio);
+                    return match && parseInt(match[1], 10) === sAlvo && parseInt(match[2], 10) === eAlvo;
+                });
+                if (temEpNosArquivos) return true;
             }
 
-            let encontradoParaOEpisodio = false;
-            let ehPackDaTemporadaCerta = false;
+            // Checa o nome principal do Torrent buscando o episódio exato
+            const matchEp = nomeTorrent.match(regexEpisodio);
+            if (matchEp) {
+                return parseInt(matchEp[1], 10) === sAlvo && parseInt(matchEp[2], 10) === eAlvo;
+            }
 
-            for (const texto of textosParaVerificar) {
-                // Teste 1: Episódio exato (S01E01)
-                const matchEp = texto.match(regexEpisodio);
-                if (matchEp) {
-                    const tEncontrada = parseInt(matchEp[1], 10);
-                    const eEncontrado = parseInt(matchEp[2], 10);
-                    if (tEncontrada === sAlvo && eEncontrado === eAlvo) {
-                        encontradoParaOEpisodio = true;
-                        break;
-                    }
-                }
-
-                // Teste 2: Pack da temporada inteira correta
-                const matchTemp = texto.match(regexPackTemporada);
-                if (matchTemp) {
-                    const tEncontrada = parseInt(matchTemp[1], 10);
-                    const ehManualPack = nomeTorrent.includes("completa") || nomeTorrent.includes("pack") || nomeTorrent.includes("complete") || nomeTorrent.includes("temporada");
-                    
-                    if (tEncontrada === sAlvo && ehManualPack) {
-                        ehPackDaTemporadaCerta = true;
-                        break;
-                    }
+            // Checa se é um Pack/Temporada Completa da temporada correta
+            const matchTemp = nomeTorrent.match(regexPackTemporada);
+            if (matchTemp) {
+                const tEncontrada = parseInt(matchTemp[1], 10);
+                const ehPack = nomeTorrent.includes("completa") || nomeTorrent.includes("pack") || nomeTorrent.includes("complete") || nomeTorrent.includes("temporada");
+                
+                // Aceita se for a temporada certa e for um pacote de episódios
+                if (tEncontrada === sAlvo && (ehPack || (!nomeTorrent.includes("e0") && !nomeTorrent.includes("e1")))) {
+                    return true;
                 }
             }
 
-            return encontradoParaOEpisodio || ehPackDaTemporadaCerta;
+            return false;
         });
     }
 
     if (resultados.length === 0) return { streams: [] };
 
-    // 3. Formata os resultados para o Stremio
+    // 3. Formata os resultados finais para o Stremio
     const streams = resultados.map(torrent => {
         const titulo = torrent.torrent_name || "Torrent Brasileiro";
         const seeds = torrent.torrent_num_seeds || 0;
