@@ -17,6 +17,10 @@ async function carregarDadosBeTor() {
 }
 carregarDadosBeTor();
 
+// Atualiza o banco automaticamente a cada 24 horas
+const INTERVALO_24H = 24 * 60 * 60 * 1000;
+setInterval(carregarDadosBeTor, INTERVALO_24H);
+
 const manifest = {
     id: "community.betorbr.online",
     version: "1.0.12",
