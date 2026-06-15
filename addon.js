@@ -2,7 +2,6 @@ const { addonBuilder } = require("stremio-addon-sdk");
 const axios = require("axios");
 
 // Coloque aqui a URL direta do items.json que você achou no site do BeTor
-// Exemplo: "https://betor.pub/data/items.json" ou a URL correta do domínio deles
 const URL_ITEMS_BETOR = "https://catalogo.betor.top/static/data/items.json"; 
 
 let torData = [];
@@ -24,7 +23,7 @@ carregarDadosBeTor();
 
 const manifest = {
     id: "community.betorbr.online",
-    version: "1.0.0",
+    version: "1.0.1",
     name: "BeTor v3 Oficial",
     description: "Busca torrents brasileiros direto do catálogo atualizado do BeTor",
     resources: ["stream"],
@@ -53,12 +52,11 @@ builder.defineStreamHandler(async ({ type, id }) => {
         // Padrões de Episódio Individual (Ex: s01e01, 1x01, e01)
         const padraoSxxExx = `s${temporada.padStart(2, '0')}e${episodio.padStart(2, '0')}`; 
         const padraoX = `${temporada}x${episodio.padStart(2, '0')}`;
-        const padraoEpisodioSolto = `e${episodio.padStart(2, '0')}`;
 
-        // Padrões de Temporada Completa (Ex: s01, season 1, 1ª temporada, completa)
-        const padraoForteTemporada = `s${temporada.padStart(2, '0')}`; // s01 (sem o 'e')
-        const padraoTextoTemporada = `${temporada}ª temporada`; // 1ª temporada
-        const padraoSeason = `season ${temporada}`; // season 1
+        // Padrões de Temporada Completa (Ex: s01, season 1, 1ª temporada)
+        const padraoForteTemporada = `s${temporada.padStart(2, '0')}`; 
+        const padraoTextoTemporada = `${temporada}ª temporada`; 
+        const padraoSeason = `season ${temporada}`; 
 
         resultados = resultados.filter(item => {
             const nomeMinusculo = (item.torrent_name || "").toLowerCase();
@@ -75,11 +73,9 @@ builder.defineStreamHandler(async ({ type, id }) => {
                                     contemNosArquivosInternos;
 
             // Regra 2: É um pacote completo da temporada atual?
-            // (Checa se cita a temporada E palavras chave de pacotes, evitando misturar com outras temporadas)
             const ehTemporadaCompleta = (nomeMinusculo.includes(padraoForteTemporada) || nomeMinusculo.includes(padraoTextoTemporada) || nomeMinusculo.includes(padraoSeason)) && 
                                         (nomeMinusculo.includes("completa") || nomeMinusculo.includes("complete") || nomeMinusculo.includes("pack") || !nomeMinusculo.includes("e0"));
 
-            // Se for o episódio exato OU o pacote completo daquela temporada, nós mostramos!
             return ehEpisodioExato || ehTemporadaCompleta;
         });
     }
@@ -113,3 +109,5 @@ builder.defineStreamHandler(async ({ type, id }) => {
     const streamsValidos = streams.filter(s => s.infoHash && s.infoHash.length === 40);
     return { streams: streamsValidos };
 });
+
+module.exports = builder.getInterface();
