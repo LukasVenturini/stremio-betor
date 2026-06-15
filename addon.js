@@ -21,7 +21,7 @@ carregarDadosBeTor();
 
 const manifest = {
     id: "community.betorbr.online",
-    version: "1.0.5",
+    version: "1.0.6",
     name: "BeTor v3 Oficial",
     description: "Busca torrents brasileiros direto do catálogo atualizado do BeTor",
     resources: ["stream"],
@@ -32,31 +32,60 @@ const manifest = {
 
 const builder = new addonBuilder(manifest);
 
+// Função para tentar limpar o título e pegar palavras-chave da obra
+function obterPalavrasChave(texto) {
+    if (!texto) return [];
+    let limpo = texto.toLowerCase()
+        .split(/(?:\d{4}|1080p|720p|4k|bluray|web\-dl|h264|x264|x265|dual|dublado|temporada|season|s\d+e\d+)/i)[0];
+    limpo = limpo.replace(/[\.\-_,:\(\)]/g, " ");
+    return limpo.split(/\s+/).filter(p => p.length > 2 && p !== "the" && p !== "dos" && p !== "com");
+}
+
 builder.defineStreamHandler(async ({ type, id }) => {
     const partesId = id.split(":");
     const imdbId = partesId[0]; 
 
     console.log(`[Stremio Cloud] Buscando fontes para ID: ${imdbId} | Tipo: ${type}`);
 
-    // 1. Filtra inicialmente pelo ID do IMDb (Filmes e Séries entram aqui)
+    // 1. Filtra inicialmente pelo ID do IMDb
     let resultados = torData.filter(item => item.imdb_id === imdbId);
 
     if (resultados.length === 0) return { streams: [] };
 
-    // 2. Se for SÉRIE, aplicamos a filtragem inteligente matemática
-    if (type === "series" && partesId[1] && partesId[2]) {
-        const sAlvo = parseInt(partesId[1], 10); // Temporada clicada (Ex: 1)
-        const eAlvo = parseInt(partesId[2], 10); // Episódio clicado (Ex: 1)
+    // Tenta descobrir o nome real da série baseado nos títulos mais frequentes para esse ID
+    let palavrasChaveObra = [];
+    if (resultados.length > 0) {
+        // Pega os 3 primeiros títulos para analisar
+        const amostras = resultados.slice(0, 3).map(r => r.torrent_name || "");
+        for (const amostra of amostras) {
+            const palavras = obterPalavrasChave(amostra);
+            if (palavras.length > 0) {
+                palavrasChaveObra = palavras;
+                break;
+            }
+        }
+    }
 
-        // Criamos Expressões Regulares flexíveis para pegar variações como: S01E01, S1E1, 1x01, 01x01, etc.
+    // 2. Se for SÉRIE, aplicamos a filtragem inteligente matemática + validação de palavras-chave
+    if (type === "series" && partesId[1] && partesId[2]) {
+        const sAlvo = parseInt(partesId[1], 10); 
+        const eAlvo = parseInt(partesId[2], 10); 
+
         const regexEpisodio = /(?:s|season\s*)(\d+)\s*(?:e|x|ep\s*)(\d+)/i;
         const regexPackTemporada = /(?:s|season\s*|temporada\s*)(\d+)/i;
 
         resultados = resultados.filter(item => {
             const nomeTorrent = (item.torrent_name || "").toLowerCase();
+            const nomeTorrentLimpo = nomeTorrent.replace(/[\.\-_]/g, " ");
 
-            // Criamos uma lista com o nome do torrent + os arquivos internos dele (se o BeTor fornecer)
-            // Assim procuramos o episódio dentro do "Pack" se for o caso
+            // Validação de segurança anti-intruso:
+            // Se descobrimos palavras-chave da série (ex: ["boys"]), o torrent obrigatoriamente precisa ter essa palavra.
+            // Isso elimina séries aleatórias (como "Off Campus") cadastradas com o ID errado.
+            if (palavrasChaveObra.length > 0) {
+                const temPalavraChave = palavrasChaveObra.some(p => nomeTorrentLimpo.includes(p));
+                if (!temPalavraChave) return false; 
+            }
+
             const textosParaVerificar = [nomeTorrent];
             if (item.torrent_files && Array.isArray(item.torrent_files)) {
                 item.torrent_files.forEach(f => textosParaVerificar.push(f.toLowerCase()));
@@ -66,7 +95,7 @@ builder.defineStreamHandler(async ({ type, id }) => {
             let ehPackDaTemporadaCerta = false;
 
             for (const texto of textosParaVerificar) {
-                // Teste 1: Procura pelo episódio exato (S01E01)
+                // Teste 1: Episódio exato (S01E01)
                 const matchEp = texto.match(regexEpisodio);
                 if (matchEp) {
                     const tEncontrada = parseInt(matchEp[1], 10);
@@ -77,13 +106,12 @@ builder.defineStreamHandler(async ({ type, id }) => {
                     }
                 }
 
-                // Teste 2: Se não achou o ep isolado, vê se o texto diz que é a temporada completa certa
+                // Teste 2: Pack da temporada inteira correta
                 const matchTemp = texto.match(regexPackTemporada);
                 if (matchTemp) {
                     const tEncontrada = parseInt(matchTemp[1], 10);
-                    const ehManualPack = nomeTorrent.includes("completa") || nomeTorrent.includes("pack") || nomeTorrent.includes("complete");
+                    const ehManualPack = nomeTorrent.includes("completa") || nomeTorrent.includes("pack") || nomeTorrent.includes("complete") || nomeTorrent.includes("temporada");
                     
-                    // Se a temporada bater e o título principal indicar que é um pack completo
                     if (tEncontrada === sAlvo && ehManualPack) {
                         ehPackDaTemporadaCerta = true;
                         break;
@@ -91,12 +119,10 @@ builder.defineStreamHandler(async ({ type, id }) => {
                 }
             }
 
-            // Retorna verdadeiro se achou o episódio exato OU se é o pack da temporada certa
             return encontradoParaOEpisodio || ehPackDaTemporadaCerta;
         });
     }
 
-    // Se o filtro limpou tudo, retorna vazio para não quebrar o Stremio
     if (resultados.length === 0) return { streams: [] };
 
     // 3. Formata os resultados para o Stremio
