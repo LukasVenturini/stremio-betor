@@ -36,13 +36,57 @@ const manifest = {
 const builder = new addonBuilder(manifest);
 
 builder.defineStreamHandler(async ({ type, id }) => {
-    const imdbId = id.split(":")[0]; 
-    console.log(`[Stremio Cloud] Buscando fontes para: ${imdbId}`);
+    const partesId = id.split(":");
+    const imdbId = partesId[0]; 
+    const temporada = partesId[1];
+    const episodio = partesId[2];
 
-    const resultados = torData.filter(item => item.imdb_id === imdbId);
+    console.log(`[Stremio Cloud] Buscando fontes para ID: ${imdbId} | Tipo: ${type}`);
+
+    // 1. Filtra inicialmente pelo ID principal da série/filme no IMDb
+    let resultados = torData.filter(item => item.imdb_id === imdbId);
+
+    // 2. Se for uma série, aplica a filtragem inteligente de episódios e temporadas completas
+    if (type === "series" && temporada && episodio) {
+        console.log(`Filtrando série: Temporada ${temporada}, Episódio ${episódio}`);
+        
+        // Padrões de Episódio Individual (Ex: s01e01, 1x01, e01)
+        const padraoSxxExx = `s${temporada.padStart(2, '0')}e${episodio.padStart(2, '0')}`; 
+        const padraoX = `${temporada}x${episodio.padStart(2, '0')}`;
+        const padraoEpisodioSolto = `e${episodio.padStart(2, '0')}`;
+
+        // Padrões de Temporada Completa (Ex: s01, season 1, 1ª temporada, completa)
+        const padraoForteTemporada = `s${temporada.padStart(2, '0')}`; // s01 (sem o 'e')
+        const padraoTextoTemporada = `${temporada}ª temporada`; // 1ª temporada
+        const padraoSeason = `season ${temporada}`; // season 1
+
+        resultados = resultados.filter(item => {
+            const nomeMinusculo = (item.torrent_name || "").toLowerCase();
+            
+            // Verifica se o termo aparece nos arquivos internos do torrent (se existirem)
+            const contemNosArquivosInternos = item.torrent_files && item.torrent_files.some(f => {
+                const fMin = f.toLowerCase();
+                return fMin.includes(padraoSxxExx) || fMin.includes(padraoX);
+            });
+
+            // Regra 1: É o episódio exato?
+            const ehEpisodioExato = nomeMinusculo.includes(padraoSxxExx) || 
+                                    nomeMinusculo.includes(padraoX) || 
+                                    contemNosArquivosInternos;
+
+            // Regra 2: É um pacote completo da temporada atual?
+            // (Checa se cita a temporada E palavras chave de pacotes, evitando misturar com outras temporadas)
+            const ehTemporadaCompleta = (nomeMinusculo.includes(padraoForteTemporada) || nomeMinusculo.includes(padraoTextoTemporada) || nomeMinusculo.includes(padraoSeason)) && 
+                                        (nomeMinusculo.includes("completa") || nomeMinusculo.includes("complete") || nomeMinusculo.includes("pack") || !nomeMinusculo.includes("e0"));
+
+            // Se for o episódio exato OU o pacote completo daquela temporada, nós mostramos!
+            return ehEpisodioExato || ehTemporadaCompleta;
+        });
+    }
 
     if (resultados.length === 0) return { streams: [] };
 
+    // Transforma os dados no formato exato exigido pelo Stremio
     const streams = resultados.map(torrent => {
         const titulo = torrent.torrent_name || "Torrent Brasileiro";
         const seeds = torrent.torrent_num_seeds || 0;
@@ -69,5 +113,3 @@ builder.defineStreamHandler(async ({ type, id }) => {
     const streamsValidos = streams.filter(s => s.infoHash && s.infoHash.length === 40);
     return { streams: streamsValidos };
 });
-
-module.exports = builder.getInterface();
