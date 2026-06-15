@@ -21,7 +21,7 @@ carregarDadosBeTor();
 
 const manifest = {
     id: "community.betorbr.online",
-    version: "1.0.2",
+    version: "1.0.3",
     name: "BeTor v3 Oficial",
     description: "Busca torrents brasileiros direto do catálogo atualizado do BeTor",
     resources: ["stream"],
@@ -35,62 +35,63 @@ const builder = new addonBuilder(manifest);
 builder.defineStreamHandler(async ({ type, id }) => {
     const partesId = id.split(":");
     const imdbId = partesId[0]; 
-    const tempNum = parseInt(partesId[1], 10); // Transforma em número puro (Ex: 1)
-    const epNum = parseInt(partesId[2], 10);   // Transforma em número puro (Ex: 1)
+    const temporada = partesId[1]; // String (Ex: "1")
+    const episodio = partesId[2];  // String (Ex: "1")
 
     console.log(`[Stremio Cloud] Buscando fontes para ID: ${imdbId} | Tipo: ${type}`);
 
-    // 1. Filtra inicialmente pelo ID principal no IMDb
+    // 1. Filtra pelo ID principal no IMDb
     let resultados = torData.filter(item => item.imdb_id === imdbId);
 
-    // 2. Se for série, aplica a filtragem com precisão matemática por RegEx
-    if (type === "series" && !isNaN(tempNum) && !isNaN(epNum)) {
-        console.log(`Filtrando série: Temporada ${tempNum}, Episódio ${epNum}`);
+    // 2. Se for série, aplica a filtragem inteligente de episódios
+    if (type === "series" && temporada && episodio) {
+        const tempOriginal = parseInt(temporada, 10);
+        const epOriginal = parseInt(episodio, 10);
+        
+        const padraoSxxExx = `s${temporada.padStart(2, '0')}e${episodio.padStart(2, '0')}`; // s01e01
+        const padraoX = `${temporada}x${episodio.padStart(2, '0')}`; // 1x01
 
         resultados = resultados.filter(item => {
             const nomeMinusculo = (item.torrent_name || "").toLowerCase();
-            
-            // Regex 1: Procura por padrões de episódio exato: s01e01, s1e1, 1x01, 01x01
-            // Captura os números isolados para podermos comparar matematicamente
-            const regexEpisodio = /(?:s|)(\d+)(?:e|x)(\d+)/i;
-            const matchEp = nomeMinusculo.match(regexEpisodio);
 
-            if (matchEp) {
-                const tEncontrada = parseInt(matchEp[1], 10);
-                const eEncontrado = parseInt(matchEp[2], 10);
-                // Só aceita se for EXATAMENTE a temporada E o episódio que você clicou
-                return tEncontrada === tempNum && eEncontrado === epNum;
+            // Se o título contiver exatamente o código do episódio (ex: S01E01 ou 1x01), RECONHECE NA HORA
+            if (nomeMinusculo.includes(padraoSxxExx) || nomeMinusculo.includes(padraoX)) {
+                return true;
             }
 
-            // Regex 2: Se não achou o episódio isolado, vê se é um Pack/Temporada Completa
-            // Procura por s01, s1, 1ª temporada, temporada 1, season 1
-            const regexTemporadaCompleta = /(?:s|season\s*|temporada\s*)(\d+)/i;
-            const matchTemp = nomeMinusculo.match(regexTemporadaCompleta);
+            // Se for um pacote/pack de temporada, precisamos garantir que é da temporada certa
+            // Ex: Se estamos na Temp 1, removemos títulos que mencionam explicitamente S02, S03, S04, S05...
+            const contemOutraTemporada = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+                .filter(t => t !== tempOriginal)
+                .some(t => {
+                    const tStr = t.toString().padStart(2, '0');
+                    return nomeMinusculo.includes(`s${tStr}`) || nomeMinusculo.includes(`${t}ª temporada`) || nomeMinusculo.includes(`season ${t}`);
+                });
 
-            if (matchTemp) {
-                const tEncontrada = parseInt(matchTemp[1], 10);
-                // Verifica se a temporada bate E se o título indica que é um pacote completo
-                const ehPack = nomeMinusculo.includes("completa") || 
-                              nomeMinusculo.includes("complete") || 
-                              nomeMinusculo.includes("pack") || 
-                              nomeMinusculo.includes("temporada");
-                
-                return tEncontrada === tempNum && ehPack;
+            if (contemOutraTemporada) {
+                return false; // Descarta se for de outra temporada
             }
 
-            // Se tiver arquivos internos detalhados no JSON, faz uma checagem rápida neles
-            if (item.torrent_files) {
-                const padraoEp = `s${tempNum.toString().padStart(2, '0')}e${epNum.toString().padStart(2, '0')}`;
-                return item.torrent_files.some(f => f.toLowerCase().includes(padraoEp));
+            // Se estamos no Episódio 1, removemos títulos que mencionam explicitamente OUTROS episódios isolados
+            // Ex: Descarta se o título tiver "E02", "E03", mas aceita se for o "E01" ou se não especificar (Pack)
+            const contemOutroEpisodio = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24]
+                .filter(e => e !== epOriginal)
+                .some(e => {
+                    const eStr = e.toString().padStart(2, '0');
+                    return nomeMinusculo.includes(`e${eStr}`) || nomeMinusculo.includes(`x${eStr}`);
+                });
+
+            if (contemOutroEpisodio) {
+                return false; // Descarta se for um episódio individual diferente do atual
             }
 
-            return false;
+            // Se passou pelos filtros, mantém (pode ser temporada completa ou arquivo geral daquela temporada)
+            return true;
         });
     }
 
     if (resultados.length === 0) return { streams: [] };
 
-    // Transforma os dados no formato exato exigido pelo Stremio
     const streams = resultados.map(torrent => {
         const titulo = torrent.torrent_name || "Torrent Brasileiro";
         const seeds = torrent.torrent_num_seeds || 0;
