@@ -29,7 +29,11 @@ const manifest = {
     resources: ["stream"],
     types: ["movie", "series"],
     idPrefixes: ["tt"],
-    catalogs: []
+    catalogs: [],
+    stremioAddonsConfig: {
+        issuer: "https://stremio-addons.net",
+        signature: "eyJhbGciOiJkaXIiLCJlbmMiOiJBMTI4Q0JDLUhTMjU2In0..59kAdWDQqyOzP9-3-dRiiw.V3fP8KGhrXiug6kHiJ0QxUh7DpXbU15iXTyCRgSTixA4VDe01OrXHNsuKFaHLVDaQxnkiI1qr9hwH55moOEcp3swskXrsc2ZAPXEfKMThDRcAzuk93JJibZdbnqWJw_5.b2TZynculzUl5X7G4dLi9w"
+    }
 };
 
 const builder = new addonBuilder(manifest);
