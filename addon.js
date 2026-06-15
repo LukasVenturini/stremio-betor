@@ -19,7 +19,7 @@ carregarDadosBeTor();
 
 const manifest = {
     id: "community.betorbr.online",
-    version: "1.0.10",
+    version: "1.0.11",
     name: "BeTor v3 Oficial",
     description: "Busca de torrents brasileiros do BeTor",
     resources: ["stream"],
@@ -37,103 +37,135 @@ builder.defineStreamHandler(async ({ type, id }) => {
     // 1. Filtra pelo IMDb ID
     let resultados = torData.filter(item => item.imdb_id === imdbId);
 
-    // 2. Para séries, aplica filtragem por temporada/episódio
+    if (type === "movie") {
+        // Para filmes: o único sinal confiável é NÃO ter seasons nem episodes.
+        // O indexador às vezes cadastra filmes como item_type="tv" por engano,
+        // então não filtramos por item_type — apenas excluímos o que claramente
+        // é série (tem seasons ou episodes preenchidos).
+        resultados = resultados.filter(item => {
+            const temTemporada = item.seasons && item.seasons.length > 0;
+            const temEpisodio  = item.episodes && item.episodes.length > 0;
+            const nome = (item.torrent_name || "").toLowerCase();
+            // Rejeita também se o nome deixa claro que é série
+            const nomeTemSerie = /s\d{1,2}e\d{1,2}|\bseason\s*\d|\btemporada\s*\d|\d+[xX]\d{2}/.test(nome);
+            return !temTemporada && !temEpisodio && !nomeTemSerie;
+        });
+    }
+
     if (type === "series" && partesId[1] && partesId[2]) {
         const sAlvo = parseInt(partesId[1], 10);
         const eAlvo = parseInt(partesId[2], 10);
 
-        // Monta strings de busca com padding (ex: "01", "1")
-        const sStr  = sAlvo.toString().padStart(2, "0");
-        const eStr  = eAlvo.toString().padStart(2, "0");
-
         resultados = resultados.filter(item => {
+            const temTemporada = item.seasons && item.seasons.length > 0;
+            const temEpisodio  = item.episodes && item.episodes.length > 0;
             const nome = (item.torrent_name || "").toLowerCase();
+            const nomeTemIndicacao = /s\d+|season\s*\d+|temporada\s*\d+|\d+[xX]\d+|\bep\s*\d+/i.test(nome);
 
-            // ----- Padrão 1: episódio exato -----
-            // Aceita: s01e01, s1e1, 1x01, 01x01, season 1 ep 1, season 1 episode 1
-            const matchEpExato =
-                new RegExp(`s0*${sAlvo}\\s*e0*${eAlvo}\\b`, "i").test(nome) ||
-                new RegExp(`\\b0*${sAlvo}[xX]0*${eAlvo}\\b`).test(nome) ||
-                new RegExp(`season\\s*0*${sAlvo}\\s*ep(?:isode)?\\s*0*${eAlvo}\\b`, "i").test(nome);
+            // Sem nenhuma indicação de série → filme intruso, descarta
+            if (!temTemporada && !temEpisodio && !nomeTemIndicacao) return false;
 
-            if (matchEpExato) return true;
-
-            // ----- Padrão 2: pack/temporada completa -----
-            // Aceita: s01 (sem episódio), temporada 1, 1ª temporada, season 1
-            // MAS rejeita se houver qualquer menção a episódio específico DIFERENTE do alvo
-            const matchTemporada =
-                new RegExp(`\\bs0*${sAlvo}\\b(?!\\s*e\\d)`, "i").test(nome) ||
-                new RegExp(`season\\s*0*${sAlvo}\\b(?!\\s*ep)`, "i").test(nome) ||
-                new RegExp(`temporada\\s*0*${sAlvo}\\b`, "i").test(nome) ||
-                new RegExp(`0*${sAlvo}\\s*ª\\s*temporada`, "i").test(nome);
-
-            if (!matchTemporada) {
-                // Sem indicação nenhuma de temporada → pode ser filme intruso
-                return false;
+            // ESTRATÉGIA PRIMÁRIA: campos estruturados `episodes` (mais confiável)
+            if (temEpisodio) {
+                return item.episodes.some(ep => ep.season === sAlvo && ep.episode === eAlvo);
             }
 
-            // É um pack da temporada certa. Verifica se o título menciona
-            // episódios específicos que NÃO incluem o nosso alvo.
-            // Ex: "S01E05-E08" — se o alvo for E03, descarta.
-            // Extrai TODOS os números de episódios explicitamente citados no nome.
-            const epsMencionados = [];
-            let m;
-
-            // Padrão s01eXX
-            const reEp1 = /s\d+\s*e(\d+)/gi;
-            while ((m = reEp1.exec(nome)) !== null) {
-                epsMencionados.push(parseInt(m[1], 10));
+            // ESTRATÉGIA SECUNDÁRIA: campo `seasons` (pack de temporada)
+            if (temTemporada) {
+                if (!item.seasons.includes(sAlvo)) return false;
+                // Verifica se o nome limita a episódios específicos
+                const epsMencionados = extrairEpisodiosDoNome(nome);
+                if (epsMencionados.length === 0) return true; // Pack completo
+                return epsMencionados.includes(eAlvo);
             }
 
-            // Padrão NxXX
-            const reEp2 = /\d+[xX](\d+)/g;
-            while ((m = reEp2.exec(nome)) !== null) {
-                epsMencionados.push(parseInt(m[1], 10));
-            }
-
-            // Padrão ep/episode XX
-            const reEp3 = /ep(?:isode)?\s*(\d+)/gi;
-            while ((m = reEp3.exec(nome)) !== null) {
-                epsMencionados.push(parseInt(m[1], 10));
-            }
-
-            if (epsMencionados.length === 0) {
-                // Pack sem episódio específico → temporada completa → inclui
-                return true;
-            }
-
-            // Se tem episódios mencionados, o alvo deve estar entre eles
-            return epsMencionados.includes(eAlvo);
+            // FALLBACK: parse do nome (entradas sem campos estruturados)
+            return filtrarPorNome(nome, sAlvo, eAlvo);
         });
     }
 
     if (resultados.length === 0) return { streams: [] };
 
-    // 3. Formata os streams para o Stremio
-    const streams = resultados.map(torrent => {
-        // Tenta extrair o hash do magnet_xt ou do magnet_uri
-        let hash = null;
+    // 2. Formata os streams para o Stremio
+    const streams = resultados
+        .filter(item => item.torrent_name)
+        .map(torrent => {
+            let hash = null;
 
-        if (torrent.magnet_xt) {
-            const parts = torrent.magnet_xt.split(":");
-            hash = parts[parts.length - 1];
-        }
+            if (torrent.magnet_xt) {
+                const match = torrent.magnet_xt.match(/btih:([a-fA-F0-9]{40})/i);
+                if (match) hash = match[1];
+                if (!hash) hash = torrent.magnet_xt.split(":").pop();
+            }
+            if (!hash && torrent.magnet_uri) {
+                const match = torrent.magnet_uri.match(/btih:([a-fA-F0-9]{40})/i);
+                if (match) hash = match[1];
+            }
 
-        if (!hash && torrent.magnet_uri) {
-            const match = torrent.magnet_uri.match(/btih:([a-fA-F0-9]{40})/i);
-            if (match) hash = match[1];
-        }
+            if (!hash || hash.length < 40) return null;
 
-        if (!hash || hash.length < 40) return null;
-
-        return {
-            name: `BeTor\n[${torrent.provider_slug || "BeTor"}]`,
-            title: `${torrent.torrent_name}\n👤 ${torrent.torrent_num_seeds || 0} Seeds`,
-            infoHash: hash.toLowerCase()
-        };
-    }).filter(s => s !== null);
+            return {
+                name: `BeTor\n[${torrent.provider_slug || "BeTor"}]`,
+                title: `${torrent.torrent_name}\n👤 ${torrent.torrent_num_seeds || 0} Seeds`,
+                infoHash: hash.toLowerCase()
+            };
+        })
+        .filter(s => s !== null);
 
     return { streams };
 });
+
+// Extrai episódios explicitamente mencionados no nome do torrent.
+// Ex: "S05E01-02" → [1,2] | "S05E04" → [4] | "S05 Pack" → []
+function extrairEpisodiosDoNome(nome) {
+    const eps = new Set();
+    let m;
+
+    // Range: s01e01-03 ou s01e01-e03
+    const reRange = /s\d+e(\d+)[-–](?:e)?(\d+)/gi;
+    while ((m = reRange.exec(nome)) !== null) {
+        const ini = parseInt(m[1], 10), fim = parseInt(m[2], 10);
+        for (let i = ini; i <= fim; i++) eps.add(i);
+    }
+    // Episódio único: s01e01
+    const reSingle = /s\d+e(\d+)(?![-–\d])/gi;
+    while ((m = reSingle.exec(nome)) !== null) eps.add(parseInt(m[1], 10));
+    // Formato NxEE
+    const reX = /\d+[xX](\d+)/g;
+    while ((m = reX.exec(nome)) !== null) eps.add(parseInt(m[1], 10));
+    // "ep 01" / "episode 01"
+    const reEp = /ep(?:isode)?\s*(\d+)/gi;
+    while ((m = reEp.exec(nome)) !== null) eps.add(parseInt(m[1], 10));
+
+    return [...eps];
+}
+
+// Filtragem por nome para entradas sem campos estruturados (dados mais antigos).
+function filtrarPorNome(nome, sAlvo, eAlvo) {
+    // Episódio exato
+    if (new RegExp(`s0*${sAlvo}\\s*e0*${eAlvo}(?!\\d)`, "i").test(nome)) return true;
+    if (new RegExp(`\\b0*${sAlvo}[xX]0*${eAlvo}\\b`).test(nome)) return true;
+    if (new RegExp(`season\\s*0*${sAlvo}\\s*ep(?:isode)?\\s*0*${eAlvo}\\b`, "i").test(nome)) return true;
+
+    // Range de episódios no nome
+    const matchRange = nome.match(new RegExp(`s0*${sAlvo}e(\\d+)[-–](?:e)?(\\d+)`, "i"));
+    if (matchRange) {
+        const ini = parseInt(matchRange[1], 10), fim = parseInt(matchRange[2], 10);
+        if (eAlvo >= ini && eAlvo <= fim) return true;
+    }
+
+    // Pack de temporada completa
+    const ehPackDaTemporada =
+        new RegExp(`\\bs0*${sAlvo}\\b(?!\\s*e\\d)`, "i").test(nome) ||
+        new RegExp(`season\\s*0*${sAlvo}\\b(?!\\s*ep)`, "i").test(nome) ||
+        new RegExp(`temporada\\s*0*${sAlvo}\\b`, "i").test(nome) ||
+        new RegExp(`0*${sAlvo}\\s*ª\\s*temporada`, "i").test(nome);
+
+    if (!ehPackDaTemporada) return false;
+
+    const epsMencionados = extrairEpisodiosDoNome(nome);
+    if (epsMencionados.length === 0) return true;
+    return epsMencionados.includes(eAlvo);
+}
 
 module.exports = builder.getInterface();
