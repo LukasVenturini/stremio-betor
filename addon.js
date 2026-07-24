@@ -1,31 +1,83 @@
 const { addonBuilder } = require("stremio-addon-sdk");
 const axios = require("axios");
 
-const URL_ITEMS_BETOR = "https://catalogo.betor.top/static/data/items.json";
+const URL_ITEMS_BETOR = process.env.BETOR_URL || "https://catalogo.betor.top/static/data/items.json";
+const INTERVALO_ATUALIZACAO_MS = Number(process.env.UPDATE_INTERVAL_MS) || 6 * 60 * 60 * 1000; // 6h por padrão
+const TIMEOUT_REQUISICAO_MS = Number(process.env.REQUEST_TIMEOUT_MS) || 15000;
+const TENTATIVAS_CARGA_INICIAL = 4;
+
+// Trackers públicos usados para acelerar a descoberta de peers via infoHash
+const TRACKERS_PUBLICOS = [
+    "tracker:udp://tracker.opentrackr.org:1337/announce",
+    "tracker:udp://open.stealth.si:80/announce",
+    "tracker:udp://tracker.torrent.eu.org:451/announce",
+    "tracker:udp://exodus.desync.com:6969/announce",
+    "tracker:udp://open.demonii.com:1337/announce"
+];
 
 let torData = [];
+// Índice por imdb_id para evitar varredura linear em cada busca
+let indexPorImdb = new Map();
+
+function construirIndice() {
+    const novoIndice = new Map();
+    for (const item of torData) {
+        if (!item || !item.imdb_id) continue;
+        if (!novoIndice.has(item.imdb_id)) novoIndice.set(item.imdb_id, []);
+        novoIndice.get(item.imdb_id).push(item);
+    }
+    indexPorImdb = novoIndice;
+}
 
 async function carregarDadosBeTor() {
-    try {
-        console.log("Baixando banco de dados atualizado do BeTor...");
-        const response = await axios.get(URL_ITEMS_BETOR);
-        torData = response.data || [];
-        console.log(`Banco de dados carregado! Itens: ${torData.length}`);
-    } catch (error) {
-        console.error("Erro crítico ao baixar dados do BeTor:", error.message);
+    console.log("Baixando banco de dados atualizado do BeTor...");
+    const response = await axios.get(URL_ITEMS_BETOR, { timeout: TIMEOUT_REQUISICAO_MS });
+    const dados = response.data;
+    if (!Array.isArray(dados)) {
+        throw new Error("Resposta do BeTor não é um array válido");
     }
+    torData = dados;
+    construirIndice();
+    console.log(`Banco de dados carregado! Itens: ${torData.length}`);
 }
-carregarDadosBeTor();
 
-// Atualiza o banco automaticamente a cada 24 horas
-const INTERVALO_24H = 24 * 60 * 60 * 1000;
-setInterval(carregarDadosBeTor, INTERVALO_24H);
+// Tenta carregar os dados no boot com retry/backoff, para não deixar o addon
+// vazio por até 24h caso a primeira tentativa falhe (ex: instabilidade de rede).
+async function carregarComRetry(tentativas = TENTATIVAS_CARGA_INICIAL) {
+    for (let i = 0; i < tentativas; i++) {
+        try {
+            await carregarDadosBeTor();
+            return;
+        } catch (error) {
+            const espera = 5000 * (i + 1);
+            console.error(
+                `Erro ao baixar dados do BeTor (tentativa ${i + 1}/${tentativas}): ${error.message}. ` +
+                `Tentando novamente em ${espera / 1000}s...`
+            );
+            if (i < tentativas - 1) {
+                await new Promise(resolve => setTimeout(resolve, espera));
+            }
+        }
+    }
+    console.error("Falha ao carregar dados do BeTor após todas as tentativas. Addon iniciará sem dados.");
+}
+
+carregarComRetry();
+
+// Atualiza o banco periodicamente (padrão: a cada 6h, configurável via env)
+setInterval(() => {
+    carregarDadosBeTor().catch(error => {
+        console.error("Erro ao atualizar dados do BeTor:", error.message);
+    });
+}, INTERVALO_ATUALIZACAO_MS);
 
 const manifest = {
     id: "community.betorbr.online",
     version: "1.0.12",
     name: "BeTor v3 Oficial",
     description: "Busca de torrents brasileiros do BeTor",
+    logo: "https://catalogo.betor.top/static/img/logo.png",
+    background: "https://catalogo.betor.top/static/img/background.png",
     resources: ["stream"],
     types: ["movie", "series"],
     idPrefixes: ["tt"],
@@ -39,97 +91,115 @@ const manifest = {
 const builder = new addonBuilder(manifest);
 
 builder.defineStreamHandler(async ({ type, id }) => {
-    const partesId = id.split(":");
-    const imdbId = partesId[0];
+    try {
+        const partesId = (id || "").split(":");
+        const imdbId = partesId[0];
 
-    // 1. Filtra pelo IMDb ID — e já descarta entradas sem torrent_name E sem episodes
-    //    (dados incompletos do indexador que causam falsos positivos)
-    let resultados = torData.filter(item =>
-        item.imdb_id === imdbId && (item.torrent_name || (item.episodes && item.episodes.length > 0))
-    );
+        // 1. Busca pelo IMDb ID usando o índice — e já descarta entradas sem torrent_name E sem episodes
+        //    (dados incompletos do indexador que causam falsos positivos)
+        let resultados = (indexPorImdb.get(imdbId) || []).filter(item =>
+            item.torrent_name || (item.episodes && item.episodes.length > 0)
+        );
 
-    if (type === "movie") {
-        // Para filmes: exclui qualquer entrada que claramente é série
-        // (não filtramos por item_type porque o indexador cadastra filmes como "tv" às vezes)
-        resultados = resultados.filter(item => {
-            const temTemporada = item.seasons && item.seasons.length > 0;
-            const temEpisodio  = item.episodes && item.episodes.length > 0;
-            const nome = (item.torrent_name || "").toLowerCase();
-            const nomeTemSerie = /s\d{1,2}e\d{1,2}|\bseason\s*\d|\btemporada\s*\d|\d+[xX]\d{2}/.test(nome);
-            return !temTemporada && !temEpisodio && !nomeTemSerie;
-        });
-    }
+        if (type === "movie") {
+            // Para filmes: exclui qualquer entrada que claramente é série
+            // (não filtramos por item_type porque o indexador cadastra filmes como "tv" às vezes)
+            resultados = resultados.filter(item => {
+                const temTemporada = item.seasons && item.seasons.length > 0;
+                const temEpisodio = item.episodes && item.episodes.length > 0;
+                const nome = (item.torrent_name || "").toLowerCase();
+                const nomeTemSerie = /s\d{1,2}e\d{1,2}|\bseason\s*\d|\btemporada\s*\d|\d+[xX]\d{2}/.test(nome);
+                return !temTemporada && !temEpisodio && !nomeTemSerie;
+            });
+        }
 
-    if (type === "series" && partesId[1] && partesId[2]) {
-        const sAlvo = parseInt(partesId[1], 10);
-        const eAlvo = parseInt(partesId[2], 10);
+        if (type === "series" && partesId[1] && partesId[2]) {
+            const sAlvo = parseInt(partesId[1], 10);
+            const eAlvo = parseInt(partesId[2], 10);
 
-        resultados = resultados.filter(item => {
-            const temTemporada = item.seasons && item.seasons.length > 0;
-            const temEpisodio  = item.episodes && item.episodes.length > 0;
-            const nome = (item.torrent_name || "").toLowerCase();
-            const nomeTemIndicacao = /s\d+|season\s*\d+|temporada\s*\d+|\d+[xX]\d+|\bep\s*\d+/i.test(nome);
+            resultados = resultados.filter(item => {
+                const temTemporada = item.seasons && item.seasons.length > 0;
+                const temEpisodio = item.episodes && item.episodes.length > 0;
+                const nome = (item.torrent_name || "").toLowerCase();
+                const nomeTemIndicacao = /s\d+|season\s*\d+|temporada\s*\d+|\d+[xX]\d+|\bep\s*\d+/i.test(nome);
 
-            // Sem nenhuma indicação de série → filme intruso, descarta
-            if (!temTemporada && !temEpisodio && !nomeTemIndicacao) return false;
+                // Sem nenhuma indicação de série → filme intruso, descarta
+                if (!temTemporada && !temEpisodio && !nomeTemIndicacao) return false;
 
-            // ESTRATÉGIA 1: campo episodes[] estruturado (mais confiável)
-            if (temEpisodio) {
-                return item.episodes.some(ep => ep.season === sAlvo && ep.episode === eAlvo);
-            }
-
-            // ESTRATÉGIA 2: campo seasons[] + episódio identificado pelo nome
-            if (temTemporada) {
-                if (!item.seasons.includes(sAlvo)) return false;
-
-                const epsMencionados = extrairEpisodiosDoNome(nome);
-
-                // Pack sem nenhum episódio identificável no nome:
-                // só aprovamos se o nome NÃO contiver padrão SxxExx de outro ep,
-                // o que indicaria que é realmente um pack completo sem ep no título
-                // (ex: "The Boys S05 Completo") — mas se o nome é vazio ou genérico
-                // sem qualquer ep, não temos como saber: descartamos para evitar falso positivo
-                if (epsMencionados.length === 0) {
-                    // Aceita apenas se o nome contiver indicação de pack/completo
-                    // e NÃO contiver padrão de episódio isolado que simplesmente não parseamos
-                    const ehPackExplicito = /\b(completo|complete|pack|full.?season|temporada.?completa)\b/i.test(nome);
-                    return ehPackExplicito;
+                // ESTRATÉGIA 1: campo episodes[] estruturado (mais confiável)
+                if (temEpisodio) {
+                    return item.episodes.some(ep => ep.season === sAlvo && ep.episode === eAlvo);
                 }
 
-                return epsMencionados.includes(eAlvo);
-            }
+                // ESTRATÉGIA 2: campo seasons[] + episódio identificado pelo nome
+                if (temTemporada) {
+                    if (!item.seasons.includes(sAlvo)) return false;
 
-            // ESTRATÉGIA 3: fallback — parse do nome para entradas sem campos estruturados
-            return filtrarPorNome(nome, sAlvo, eAlvo);
-        });
+                    const epsMencionados = extrairEpisodiosDoNome(nome);
+
+                    // Pack sem nenhum episódio identificável no nome:
+                    // só aprovamos se o nome NÃO contiver padrão SxxExx de outro ep,
+                    // o que indicaria que é realmente um pack completo sem ep no título
+                    // (ex: "The Boys S05 Completo") — mas se o nome é vazio ou genérico
+                    // sem qualquer ep, não temos como saber: descartamos para evitar falso positivo
+                    if (epsMencionados.length === 0) {
+                        // Aceita apenas se o nome contiver indicação de pack/completo
+                        // e NÃO contiver padrão de episódio isolado que simplesmente não parseamos
+                        const ehPackExplicito = /\b(completo|complete|pack|full.?season|temporada.?completa)\b/i.test(nome);
+                        return ehPackExplicito;
+                    }
+
+                    return epsMencionados.includes(eAlvo);
+                }
+
+                // ESTRATÉGIA 3: fallback — parse do nome para entradas sem campos estruturados
+                return filtrarPorNome(nome, sAlvo, eAlvo);
+            });
+        }
+
+        if (resultados.length === 0) return { streams: [] };
+
+        // 2. Formata os streams, remove duplicados por hash e ordena por seeds (melhores primeiro)
+        const hashesVistos = new Set();
+        const streams = resultados
+            .map(torrent => {
+                let hash = null;
+
+                if (torrent.magnet_xt) {
+                    const match = torrent.magnet_xt.match(/btih:([a-fA-F0-9]{40})/i);
+                    if (match) hash = match[1];
+                    if (!hash) hash = torrent.magnet_xt.split(":").pop();
+                }
+                if (!hash && torrent.magnet_uri) {
+                    const match = torrent.magnet_uri.match(/btih:([a-fA-F0-9]{40})/i);
+                    if (match) hash = match[1];
+                }
+
+                if (!hash || hash.length < 40) return null;
+
+                hash = hash.toLowerCase();
+                if (hashesVistos.has(hash)) return null; // descarta duplicata
+                hashesVistos.add(hash);
+
+                const seeds = torrent.torrent_num_seeds || 0;
+
+                return {
+                    name: `BeTor\n[${torrent.provider_slug || "BeTor"}]`,
+                    title: `${torrent.torrent_name || "Sem título"}\n👤 ${seeds} Seeds`,
+                    infoHash: hash,
+                    sources: TRACKERS_PUBLICOS,
+                    _seeds: seeds // usado só para ordenação, removido a seguir
+                };
+            })
+            .filter(s => s !== null)
+            .sort((a, b) => b._seeds - a._seeds)
+            .map(({ _seeds, ...stream }) => stream);
+
+        return { streams };
+    } catch (error) {
+        console.error("Erro ao processar defineStreamHandler:", error.message);
+        return { streams: [] };
     }
-
-    if (resultados.length === 0) return { streams: [] };
-
-    // 2. Formata os streams para o Stremio
-    const streams = resultados.map(torrent => {
-        let hash = null;
-
-        if (torrent.magnet_xt) {
-            const match = torrent.magnet_xt.match(/btih:([a-fA-F0-9]{40})/i);
-            if (match) hash = match[1];
-            if (!hash) hash = torrent.magnet_xt.split(":").pop();
-        }
-        if (!hash && torrent.magnet_uri) {
-            const match = torrent.magnet_uri.match(/btih:([a-fA-F0-9]{40})/i);
-            if (match) hash = match[1];
-        }
-
-        if (!hash || hash.length < 40) return null;
-
-        return {
-            name: `BeTor\n[${torrent.provider_slug || "BeTor"}]`,
-            title: `${torrent.torrent_name || "Sem título"}\n👤 ${torrent.torrent_num_seeds || 0} Seeds`,
-            infoHash: hash.toLowerCase()
-        };
-    }).filter(s => s !== null);
-
-    return { streams };
 });
 
 // Extrai todos os números de episódios mencionados explicitamente no nome.
